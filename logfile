@@ -1,0 +1,20 @@
+2026-05-05 17:06:34.300 WIB [8507] LOG:  starting PostgreSQL 17.6 on x86_64-pc-linux-gnu, compiled by clang version 20.1.8, 64-bit
+2026-05-05 17:06:34.300 WIB [8507] LOG:  listening on IPv4 address "127.0.0.1", port 5432
+2026-05-05 17:06:34.301 WIB [8507] LOG:  listening on Unix socket "/run/postgresql/.s.PGSQL.5432"
+2026-05-05 17:06:34.307 WIB [8510] LOG:  database system was interrupted; last known up at 2026-05-05 14:38:35 WIB
+2026-05-05 17:06:34.905 WIB [8510] LOG:  database system was not properly shut down; automatic recovery in progress
+2026-05-05 17:06:34.909 WIB [8510] LOG:  redo starts at 0/1E841B8
+2026-05-05 17:06:34.909 WIB [8510] LOG:  invalid record length at 0/1E842C0: expected at least 24, got 0
+2026-05-05 17:06:34.909 WIB [8510] LOG:  redo done at 0/1E84288 system usage: CPU: user: 0.00 s, system: 0.00 s, elapsed: 0.00 s
+2026-05-05 17:06:34.913 WIB [8508] LOG:  checkpoint starting: end-of-recovery immediate wait
+2026-05-05 17:06:34.922 WIB [8508] LOG:  checkpoint complete: wrote 3 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.003 s, sync=0.002 s, total=0.010 s; sync files=2, longest=0.001 s, average=0.001 s; distance=0 kB, estimate=0 kB; lsn=0/1E842C0, redo lsn=0/1E842C0
+2026-05-05 17:06:34.925 WIB [8507] LOG:  database system is ready to accept connections
+2026-05-05 17:06:40.456 WIB [8601] FATAL:  role "username" does not exist
+2026-05-05 17:11:34.965 WIB [8508] LOG:  checkpoint starting: time
+2026-05-05 17:11:37.092 WIB [8508] LOG:  checkpoint complete: wrote 22 buffers (0.1%); 0 WAL file(s) added, 0 removed, 0 recycled; write=2.113 s, sync=0.008 s, total=2.129 s; sync files=14, longest=0.001 s, average=0.001 s; distance=10 kB, estimate=10 kB; lsn=0/1E86B50, redo lsn=0/1E86AF8
+2026-05-05 17:16:34.188 WIB [8508] LOG:  checkpoint starting: time
+2026-05-05 17:16:36.624 WIB [8508] LOG:  checkpoint complete: wrote 25 buffers (0.2%); 0 WAL file(s) added, 0 removed, 0 recycled; write=2.415 s, sync=0.011 s, total=2.437 s; sync files=10, longest=0.003 s, average=0.002 s; distance=160 kB, estimate=160 kB; lsn=0/1EAEBA8, redo lsn=0/1EAEB50
+2026-05-05 18:16:35.404 WIB [8508] LOG:  checkpoint starting: time
+2026-05-05 18:16:36.021 WIB [8508] LOG:  checkpoint complete: wrote 7 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.604 s, sync=0.004 s, total=0.618 s; sync files=6, longest=0.002 s, average=0.001 s; distance=19 kB, estimate=146 kB; lsn=0/1EB3AC8, redo lsn=0/1EB3A70
+2026-05-05 18:26:35.142 WIB [8508] LOG:  checkpoint starting: time
+2026-05-05 18:26:35.365 WIB [8508] LOG:  checkpoint complete: wrote 3 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.203 s, sync=0.004 s, total=0.223 s; sync files=3, longest=0.002 s, average=0.002 s; distance=4 kB, estimate=131 kB; lsn=0/1EB4D50, redo lsn=0/1EB4CF8

@@ -1,0 +1,102 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.2.4/schema.json",
+  "vcs": { "enabled": true, "clientKind": "git", "useIgnoreFile": false },
+  "files": {
+    "ignoreUnknown": false
+  },
+  "formatter": { "enabled": false },
+  "assist": {
+    "enabled": false
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": true,
+
+      "a11y": {
+        "useButtonType": "off",
+        "noLabelWithoutControl": "off",
+        "useAltText": "off",
+        "useFocusableInteractive": "off",
+        "noSvgWithoutTitle": "off",
+        "useAriaPropsSupportedByRole": "off",
+        "useKeyWithClickEvents": "off",
+        "useSemanticElements": "off",
+        "noStaticElementInteractions": "off",
+        "useKeyWithMouseEvents": "off",
+        "useAriaPropsForRole": "off",
+        "noAutofocus": "off",
+        "useIframeTitle": "off",
+        "useMediaCaption": "off",
+        "noRedundantRoles": "off",
+        "noRedundantAlt": "off",
+        "noNoninteractiveTabindex": "off"
+      },
+      "complexity": {
+        "noExcessiveCognitiveComplexity": "off",
+        "useSimplifiedLogicExpression": "off"
+      },
+      "correctness": {
+        "noUnusedVariables": "warn",
+        "useUniqueElementIds": "off",
+        "useExhaustiveDependencies": "off",
+        "noNestedComponentDefinitions": "off",
+        "noSwitchDeclarations": "off",
+        "noUnusedFunctionParameters": {
+          "level": "warn"
+        }
+      },
+      "performance": {
+        "useTopLevelRegex": "off",
+        "noAccumulatingSpread": "off"
+      },
+      "style": {
+        "useConsistentArrayType": "off",
+        "noMagicNumbers": "off",
+        "useNamingConvention": "off",
+        "useBlockStatements": "off",
+        "useFilenamingConvention": "off",
+        "useDefaultSwitchClause": "off",
+        "useImportType": {
+          "level": "warn",
+          "options": { "style": "inlineType" }
+        },
+        "noNonNullAssertion": "off",
+        "noNestedTernary": "off",
+        "noUselessElse": "off",
+        "useTemplate": "off",
+        "useForOf": "off",
+        "noEnum": "off",
+        "noExportedImports": "off",
+        "noDescendingSpecificity": "off"
+      },
+      "suspicious": {
+        "noEmptyInterface": "off",
+        "useAwait": "off",
+        "noArrayIndexKey": "off",
+        "noImplicitAnyLet": "off",
+        "useIterableCallbackReturn": "off",
+        "noDoubleEquals": "off",
+        "noShadowRestrictedNames": "off",
+        "noEmptyBlockStatements": "off",
+        "noUnknownAtRules": "off",
+        "noConsole": "off",
+        "noDocumentCookie": "off",
+        "noConfusingVoidType": "off"
+      },
+      "nursery": {
+        "useConsistentArrowReturn": "off",
+        "noUselessUndefined": "off",
+        "noShadow": "off"
+      }
+    },
+    "includes": [
+      "**",
+      "!node_modules/**",
+      "!.next/**",
+      "!out/**",
+      "!build/**",
+      "!next-env.d.ts"
+    ]
+  }
+}
