@@ -1,17 +1,20 @@
-# Migration Guide — Split presentation-ai into Next.js (frontend) + Express (backend service)
+# Migration Guide — Split presentation-ai into Next.js (frontend) + Express (backend service) — Drizzle edition
 
 ## Context
 
-`presentation-ai` is currently one Next.js 16 / React 19 app that owns UI + AI generation (LangChain + LangGraph + OpenAI/Together/FAL/Tavily/Gemini) + Postgres persistence (Prisma) + NextAuth + UploadThing.
+`presentation-ai` is currently one Next.js 16 / React 19 app that owns UI + AI generation (LangChain + LangGraph + OpenAI/Together/FAL/Tavily/Gemini) + Postgres persistence (currently via **Prisma**) + NextAuth + UploadThing.
 
-Goal: extract the backend so AI generation + persistence become **a reusable service any project can call over HTTP**, while the Next.js app becomes a pure UI client.
+Goal: extract the backend so AI generation + persistence become **a reusable service any project can call over HTTP**, while the Next.js app becomes a pure UI client. As part of the split, **swap Prisma for Drizzle ORM**.
 
-**Yes, this split is feasible.** The codebase is already shaped for it — every "backend-y" thing lives in `src/app/api/*`, `src/app/_actions/*`, `src/ai/*`, `src/server/*`, and `src/lib/modelPicker.ts`. UI ↔ backend seams are well defined: REST routes + server actions + AI-SDK `useChat`.
+The split is feasible. The codebase is already shaped for it — every "backend-y" thing lives in `src/app/api/*`, `src/app/_actions/*`, `src/ai/*`, `src/server/*`, and `src/lib/modelPicker.ts`. UI ↔ backend seams are well defined: REST routes + server actions + AI-SDK `useChat`.
+
+**Important:** the live Postgres database does not need to be migrated. Drizzle reads/writes the same tables Prisma already created. We only swap the access layer — `prisma.x.findMany(...)` → `db.query.x.findMany(...)`.
 
 Decisions captured up front:
 - **Service scope:** AI generation + persistence (Express owns AI *and* DB CRUD).
 - **Auth:** JWT (reuse NextAuth). Next.js issues JWTs; Express verifies them with the shared `NEXTAUTH_SECRET`.
-- **DB ownership:** Express only. Next.js never imports `@prisma/client`.
+- **DB ownership:** Express owns all business-logic DB access. The only carve-out is the NextAuth adapter on apps/web, which writes to the auth tables (`User`, `Account`, `Session`, `VerificationToken`) during sign-in. Both apps use the same Drizzle schema, exported from `packages/shared`.
+- **ORM:** Drizzle ORM + `drizzle-kit` for migrations. Existing Postgres data stays untouched.
 
 ---
 
@@ -40,11 +43,12 @@ Decisions captured up front:
 6. File-by-file mapping (old → new)
 7. JWT middleware code (full)
 8. Frontend `api.ts` wrapper code
-9. Express bootstrap code
+9. Express bootstrap + Drizzle handler example
 10. Phased migration plan with exact commands
-11. Environment variables — who needs what
-12. Verification checklist
-13. Out of scope (future work)
+11. Translating the Prisma schema to Drizzle (every model)
+12. Environment variables — who needs what
+13. Verification checklist
+14. Out of scope (future work)
 
 ---
 
@@ -63,24 +67,27 @@ presentation-ai/
 │   │   ├── tsconfig.json
 │   │   └── src/
 │   │       ├── app/
-│   │       │   ├── (pages)/...           # all current pages
+│   │       │   ├── (pages)/...
 │   │       │   ├── api/
 │   │       │   │   ├── auth/[...nextauth]/route.ts   # NextAuth — STAYS
+│   │       │   │   ├── auth/jwt/route.ts             # NEW: returns raw JWT to client
 │   │       │   │   └── uploadthing/                  # UploadThing — STAYS
-│   │       │   └── share/                # public share page
-│   │       ├── components/               # all UI (unchanged)
-│   │       ├── states/                   # Zustand (unchanged)
-│   │       ├── hooks/                    # frontend hooks
+│   │       │   └── share/
+│   │       ├── components/
+│   │       ├── states/
+│   │       ├── hooks/
 │   │       ├── lib/
 │   │       │   ├── api.ts                # NEW: typed fetch wrapper to Express
 │   │       │   └── auth-helpers.ts       # NEW: getJwtForCurrentSession()
-│   │       └── env.js                    # client + NextAuth env only
+│   │       ├── server/
+│   │       │   ├── auth.ts               # NextAuth config + DrizzleAdapter
+│   │       │   └── db.ts                 # tiny Drizzle instance for the adapter ONLY
+│   │       └── env.js
 │   └── api/                              # Express service — port 3001
 │       ├── package.json
 │       ├── tsconfig.json
-│       ├── prisma/
-│       │   ├── schema.prisma             # MOVED here
-│       │   └── migrations/
+│       ├── drizzle.config.ts             # points at packages/shared/src/db/schema.ts
+│       ├── drizzle/                      # generated migration SQL files (drizzle-kit)
 │       └── src/
 │           ├── index.ts                  # express bootstrap
 │           ├── routes/
@@ -102,17 +109,22 @@ presentation-ai/
 │           │   └── observability/        # MOVED
 │           └── server/
 │               ├── auth.ts               # NEW: JWT verify only
-│               ├── db.ts                 # MOVED Prisma client
+│               ├── db.ts                 # Drizzle instance for Express
 │               └── share/
-│                   └── authorization.ts  # MOVED
+│                   └── authorization.ts  # MOVED, ported to Drizzle
 └── packages/
-    └── shared/                           # types + zod schemas shared by both apps
+    └── shared/
         ├── package.json
         └── src/
             ├── index.ts
+            ├── db/
+            │   ├── schema.ts             # canonical Drizzle schema (every table)
+            │   └── relations.ts          # Drizzle relations
             ├── dtos/                     # PresentationDTO, ThemeDTO, ...
             └── schemas/                  # zod schemas for every request body
 ```
+
+The Drizzle schema lives in `packages/shared` so both apps reference one source of truth. Migrations are owned by `apps/api` (`drizzle-kit` config there).
 
 **Local dev:** `pnpm -F web dev` and `pnpm -F api dev` in two terminals (or `pnpm dev` at the root using `concurrently`).
 
@@ -127,18 +139,29 @@ presentation-ai/
 NextAuth in `apps/web` already uses a JWT session strategy. Keep it. The flow is:
 
 1. NextAuth signs the session JWT with `NEXTAUTH_SECRET` and stores it in an HTTP-only cookie.
-2. On every Express call, the frontend reads the JWT (server-side via `next-auth/jwt` `getToken`, or by hitting a small `/api/auth/jwt` endpoint from the client) and attaches `Authorization: Bearer <jwt>`.
-3. `apps/api` middleware verifies the JWT against the same `NEXTAUTH_SECRET` and attaches `req.user = { id, role, hasAccess, isAdmin }`.
-4. **Only coupling between the two apps at runtime is the shared secret.**
+2. NextAuth uses `@auth/drizzle-adapter` (replacing `@auth/prisma-adapter`) to persist `User`, `Account`, `Session`, `VerificationToken` rows on first sign-in. **This is the only DB access apps/web does.**
+3. On every Express call, the frontend reads the JWT and attaches `Authorization: Bearer <jwt>`.
+4. `apps/api` middleware verifies the JWT against the same `NEXTAUTH_SECRET` and attaches `req.user = { id, role, hasAccess, isAdmin }`. **JWT verification needs no DB access** — all required info is in the JWT claims (set by the NextAuth `jwt` callback).
 5. Public endpoints (e.g. `GET /v1/presentations/:id/shared`) skip the middleware via a route-level allowlist.
 
 > External (non-Next.js) consumers can either: (a) implement NextAuth flow and obtain a JWT, or (b) use a future `/auth/exchange` endpoint that swaps a service API key for a short-lived JWT. The verifier won't change.
 
-### 2.2 Data model (Prisma)
+### 2.2 Data model (Drizzle)
 
-Move `prisma/` whole into `apps/api/prisma/`. **Schema unchanged.** Models: `User`, `BaseDocument`, `Presentation`, `PresentationTheme`, `FavoritePresentationTheme`, `PresentationThemeLike`, `FontPair`, `FavoriteDocument`, `GeneratedImage`, `Account`. Prisma client is instantiated only in `apps/api/src/server/db.ts`.
+Drizzle defines tables as TypeScript values; types are inferred at compile time. Schema lives at `packages/shared/src/db/schema.ts`. Both apps import from it.
 
-`canEditDocument` / `canReadDocument` (currently `src/server/share/authorization.ts`) move to `apps/api/src/server/share/` and are called inside route handlers, not middleware.
+**Initial generation:** point `drizzle-kit pull` at the live Postgres to introspect the existing schema and emit `schema.ts` automatically:
+
+```bash
+# At apps/api/
+pnpm drizzle-kit pull
+```
+
+This reads tables created by Prisma and produces a Drizzle schema that matches them column-for-column. You then clean it up by hand (rename JS field names, add relation helpers, attach index helpers, etc.). The full hand-written schema is in Section 11.
+
+**Tables (unchanged from Prisma):** `User`, `Account`, `BaseDocument`, `Presentation`, `PresentationTheme` (mapped to table `CustomTheme`), `FavoritePresentationTheme`, `PresentationThemeLike`, `FontPair`, `FavoriteDocument`, `GeneratedImage`. NextAuth also expects `Session` and `VerificationToken` — these aren't in the current Prisma schema (because the project uses JWT strategy without DB sessions); add them only if you switch to database sessions.
+
+`canEditDocument` / `canReadDocument` (currently `src/server/share/authorization.ts`) are ported to Drizzle queries and called from Express route handlers.
 
 ### 2.3 API contract (REST + SSE)
 
@@ -187,6 +210,8 @@ Browser                           apps/web (Next.js)              apps/api (Expr
    │ 1. /auth/signin (Google OAuth)    │                                 │
    ├───────────────────────────────────▶│                                 │
    │                                    │ NextAuth handles OAuth          │
+   │                                    │ DrizzleAdapter writes User+     │
+   │                                    │ Account rows on first sign-in.  │
    │                                    │ Issues JWT signed with          │
    │                                    │ NEXTAUTH_SECRET, stored in      │
    │                                    │ HTTP-only `next-auth.session-   │
@@ -196,11 +221,8 @@ Browser                           apps/web (Next.js)              apps/api (Expr
    │                                    │                                 │
    │ 3. User opens dashboard           │                                 │
    ├───────────────────────────────────▶│                                 │
-   │                                    │ Server component reads JWT      │
-   │                                    │ via `getToken({ req })` and     │
-   │                                    │ passes it to client via prop    │
-   │                                    │ OR client calls /api/auth/jwt   │
-   │                                    │ to fetch the raw token.         │
+   │                                    │ /api/auth/jwt route returns     │
+   │                                    │ the raw JWT to the client.      │
    │                                    │                                 │
    │ 4. fetch /v1/presentations        │                                 │
    │    Authorization: Bearer <jwt>    │                                 │
@@ -210,14 +232,14 @@ Browser                           apps/web (Next.js)              apps/api (Expr
    │                                                                      │    signature with NEXTAUTH_SECRET
    │                                                                      │    Attaches req.user
    │                                                                      │
-   │                                                                      │ 6. handler queries Prisma
+   │                                                                      │ 6. handler queries Drizzle
    │                                                                      │    using req.user.id
    │                                                                      │
    │ 7. JSON response                                                     │
    │◀─────────────────────────────────────────────────────────────────────┤
 ```
 
-NextAuth uses `next-auth.session-token` with HS256 by default for JWT strategy. Express verifies the same algorithm.
+NextAuth uses HS256 by default for JWT strategy. Express verifies the same algorithm. The JWT carries `sub`, `role`, `hasAccess`, `isAdmin` (set in the NextAuth `jwt` callback).
 
 For **streaming** endpoints (every `/v1/generate/*`, `/v1/agent/*`, `/v1/diagrams/*`), the `useChat` hook from `@ai-sdk/react` accepts `headers: { Authorization: \`Bearer ${jwt}\` }`. Same flow — auth header on every call.
 
@@ -235,7 +257,7 @@ return createUIMessageStreamResponse({
 
 This returns a Web `Response` whose body is a `ReadableStream`. Next.js handles it natively. **Express does not.** Two options:
 
-**Option A — `@ai-sdk/express` adapter (recommended).** Use `pipeUIMessageStreamToResponse(res, stream)`. The package mirrors what Next.js does for `Response`. Add it to `apps/api/package.json`.
+**Option A — `@ai-sdk/express` adapter (recommended).** Use `pipeUIMessageStreamToResponse(res, stream)`. The package mirrors what Next.js does for `Response`.
 
 **Option B — manual.** Set headers and write chunks:
 
@@ -271,7 +293,7 @@ For every process below: client trigger → request shape → Express handler re
 ### 5.1 Sign in / session
 
 - **Trigger:** user clicks "Sign in with Google".
-- **Flow:** entirely inside `apps/web`, handled by NextAuth. Express not involved.
+- **Flow:** entirely inside `apps/web`. NextAuth handles OAuth; `@auth/drizzle-adapter` upserts `User` + `Account` rows via the apps/web Drizzle instance.
 - **Outcome:** NextAuth cookie containing the JWT. Subsequent Express calls attach this JWT.
 
 ### 5.2 Outline generation (SSE)
@@ -297,7 +319,7 @@ For every process below: client trigger → request shape → Express handler re
   3. Build LangChain `RunnableSequence` with `PromptTemplate` (port from `outline/route.ts`)
   4. If `webSearch`, call Tavily and inject results into the prompt
   5. Stream model output as SSE
-- **Response:** SSE stream of markdown outline chunks (as currently).
+- **Response:** SSE stream of markdown outline chunks.
 - **Client effect:** `useChat` accumulates chunks → Zustand `presentation-state.outline` updates live → on completion, frontend POSTs `PATCH /v1/presentations/:id` with the finalized outline.
 
 ### 5.3 Full presentation generation (SSE)
@@ -329,7 +351,7 @@ For every process below: client trigger → request shape → Express handler re
   2. Build LangChain chain with `DEFAULT_LAYOUTS` prompt prefix (port from `generate/route.ts`)
   3. Stream XML chunks
 - **Response:** SSE stream of XML chunks describing slides.
-- **Client effect:** XML is parsed on the fly into slides and pushed into `presentation-state`. Each completed slide triggers `PATCH /v1/presentations/:id`. `<IMG>` placeholders trigger `POST /v1/images/generate` in parallel.
+- **Client effect:** XML parsed on the fly into slides and pushed into `presentation-state`. Each completed slide triggers `PATCH /v1/presentations/:id`. `<IMG>` placeholders trigger `POST /v1/images/generate` in parallel.
 
 ### 5.4 Single slide regeneration (SSE)
 
@@ -371,13 +393,9 @@ This is the most complex flow.
 - **Request body:**
   ```ts
   {
-    messages: UIMessage[];          // ai-sdk message history
-    presentationId: string;         // for thread persistence
-    presentationContext: {          // current slide JSON, theme, etc.
-      slides: Slide[];
-      theme: string;
-      ...
-    };
+    messages: UIMessage[];
+    presentationId: string;
+    presentationContext: { slides: Slide[]; theme: string; ... };
     modelId?: string;
     modelProvider?: 'openai' | 'ollama' | 'lmstudio' | 'openrouter';
     webSearch?: boolean;
@@ -385,9 +403,9 @@ This is the most complex flow.
   ```
 - **Express responsibilities:**
   1. `jwtMiddleware`
-  2. Verify `canEditDocument(req.user.id, presentationId)`
-  3. Build LangGraph agent via `createAgent({ modelId, modelProvider, webSearch, presentationContext })` (ported from `src/ai/agents/presentation/createAgent.ts`)
-  4. Use `PostgresSaver` checkpointer keyed on `thread_id = presentationId` so conversations resume. Same Postgres, separate tables (`@langchain/langgraph-checkpoint-postgres` creates them automatically).
+  2. Verify `canEditDocument(req.user.id, presentationId)` (Drizzle query)
+  3. Build LangGraph agent via `createAgent({ ... })` (ported from `src/ai/agents/presentation/createAgent.ts`)
+  4. Use `PostgresSaver` checkpointer keyed on `thread_id = presentationId`. Same Postgres, separate tables (`@langchain/langgraph-checkpoint-postgres` creates them automatically — these tables are managed by LangGraph, not Drizzle).
   5. Stream agent state via `toUIMessageStream(...)` → `pipeUIMessageStreamToResponse(res, ...)`
 - **Tools (run server-side inside the agent):**
   - `search_tool` → Tavily web search
@@ -401,12 +419,13 @@ This is the most complex flow.
 - **Endpoint:** `POST /v1/agent/presentation/search`
 - **Body:** `{ query: string }`
 - **Response:** JSON. `{ results: TavilyResult[] }`
-- Used when the agent UI wants to preview search hits before sending the user's message.
 
 ### 5.9 Local & OpenRouter model discovery
 
-- `GET /v1/models/local` → JSON list. Calls `localhost:11434/api/tags` (Ollama) and `localhost:1234/v1/models` (LM Studio) **on the Express host**. Returns merged list. ⚠ This means the user's local Ollama runs on the Express host, not on their browser machine. If you want browser-local models, this endpoint must stay in Next.js *or* the client must call Ollama directly. **Decision needed at implementation time** — see Section 13.
+- `GET /v1/models/local` → JSON list. Calls `localhost:11434/api/tags` (Ollama) and `localhost:1234/v1/models` (LM Studio) **on the Express host**.
 - `GET /v1/models/openrouter` → JSON list, fetched from OpenRouter API.
+
+> ⚠ Local model discovery via Express probes the API host's localhost, not the user's. If browser-local discovery is required, leave `/v1/models/local` as a Next.js route or call Ollama directly from the browser. See Section 14.
 
 ### 5.10 Presentation CRUD + auto-save
 
@@ -422,13 +441,13 @@ Auto-save flow:
 1. Editor change → Zustand updates locally (instant UI).
 2. `useDebouncedSave` waits 800 ms.
 3. Calls `api.presentations.update(id, partial)` → `PATCH /v1/presentations/:id`.
-4. Express verifies `canEditDocument`, applies the partial update via Prisma, returns the updated row.
+4. Express verifies `canEditDocument`, applies the partial via Drizzle, returns the updated row.
 
 ### 5.11 Public share (no auth)
 
 - **Endpoint:** `GET /v1/presentations/:id/shared`
 - **Auth:** none — middleware allowlisted.
-- **Express responsibilities:** read presentation only if `isPublic = true`. If not, 404 (not 401, to avoid leaking existence).
+- **Express responsibilities:** read presentation only if `isPublic = true`. If not, 404.
 - **Client effect:** `app/share/presentation/[id]/page.tsx` (Server Component) calls this from the Next.js server, renders read-only view.
 
 ### 5.12 Theme CRUD + favorite + like
@@ -453,45 +472,41 @@ Auto-save flow:
 
 | Endpoint | Body | Behavior |
 |---|---|---|
-| `POST /v1/images/generate` | `{ prompt, model: 'fal'\|'together', size? }` | Calls FAL or Together; saves a `GeneratedImage` row; returns `{ url }`. |
-| `GET /v1/images/unsplash?q=&page=` | — | Proxies Unsplash search. |
+| `POST /v1/images/generate` | `{ prompt, model: 'fal'\|'together', size? }` | Calls FAL or Together; saves a `GeneratedImage` row via Drizzle; returns `{ url }`. |
+| `GET /v1/images/unsplash?q=&page=` | — | Proxies Unsplash. |
 | `GET /v1/images/pixabay?q=&page=` | — | Proxies Pixabay. |
 | `GET /v1/images/giphy?q=&page=` | — | Proxies Giphy. |
 
-All image-provider API keys live in `apps/api` only; the browser never sees them.
+All image-provider API keys live in `apps/api` only.
 
 ### 5.15 File upload (UploadThing — stays in Next.js)
 
-1. User picks file → `<UploadButton>` POSTs to `/api/uploadthing` on Next.js (NextAuth `auth()` verifies session — already works, unchanged).
-2. UploadThing returns the CDN URL to the client.
-3. Client posts the URL to e.g. `POST /v1/font-pairs` on Express. Express persists. Done.
-
-UploadThing has its own metadata in its hosted service; we only persist the URL string.
+1. User picks file → `<UploadButton>` POSTs to `/api/uploadthing` on Next.js (NextAuth `auth()` verifies session).
+2. UploadThing returns the CDN URL.
+3. Client posts the URL to `POST /v1/font-pairs` (or other) on Express. Express persists via Drizzle.
 
 ---
 
 ## 6. File-by-file mapping (old → new)
 
-### Move whole directories
+### Move (whole directories or files)
 
 | From | To |
 |---|---|
-| `prisma/` | `apps/api/prisma/` |
 | `src/ai/` | `apps/api/src/ai/` |
 | `src/lib/modelPicker.ts` | `apps/api/src/lib/modelPicker.ts` |
 | `src/lib/observability/` | `apps/api/src/lib/observability/` |
-| `src/server/db.ts` | `apps/api/src/server/db.ts` |
 | `src/server/share/authorization.ts` | `apps/api/src/server/share/authorization.ts` |
 
-### Split
+### Rewrite (different ORM)
 
-`src/server/auth.ts` (currently has both NextAuth config and `auth()` helper):
-- NextAuth config (`authOptions`, providers, callbacks) → `apps/web/src/server/auth.ts`.
-- New file `apps/api/src/server/auth.ts` with only `verifyJwt(token)` using `jose` + `NEXTAUTH_SECRET`.
+| From | To | Notes |
+|---|---|---|
+| `prisma/schema.prisma` | `packages/shared/src/db/schema.ts` + `packages/shared/src/db/relations.ts` | See Section 11 — full Drizzle schema |
+| `src/server/db.ts` (Prisma client) | `apps/api/src/server/db.ts` (Drizzle instance) + `apps/web/src/server/db.ts` (Drizzle instance for adapter only) | Two instances, same schema |
+| `src/server/auth.ts` | Split: NextAuth config → `apps/web/src/server/auth.ts` (now uses `DrizzleAdapter`); JWT verifier → `apps/api/src/server/auth.ts` | |
 
-### Convert and move
-
-Each of these becomes a route handler in `apps/api/src/routes/`:
+### Convert (server actions / routes → Express handlers, queries Prisma → Drizzle)
 
 | From | To |
 |---|---|
@@ -531,10 +546,11 @@ Each of these becomes a route handler in `apps/api/src/routes/`:
 
 - `src/app/api/agent/`, `src/app/api/presentation/`
 - `src/app/_actions/`
-- `src/server/db.ts`, `src/server/share/`
+- `src/server/share/`
 - `src/ai/`, `src/lib/modelPicker.ts`, `src/lib/observability/`
-- `prisma/`
-- Remove `@prisma/client`, `prisma`, `langchain`, `@langchain/*`, `@ai-sdk/langchain`, `@tavily/core`, `@fal-ai/client`, `together-ai`, `pg` from `apps/web/package.json`.
+- `prisma/` (entire directory — schema, migrations folder)
+- Remove from `apps/web/package.json`: `@prisma/client`, `prisma`, `@auth/prisma-adapter`, `langchain`, `@langchain/*`, `@ai-sdk/langchain`, `@tavily/core`, `@fal-ai/client`, `together-ai`, `pg`.
+- Remove `prisma` block from any package.json (the `postinstall: prisma generate` script).
 
 ---
 
@@ -577,9 +593,7 @@ export async function jwtMiddleware(
     const decoded = await decode({
       token,
       secret: process.env.NEXTAUTH_SECRET!,
-      // salt: must match NextAuth's cookie name; for the default JWT strategy
-      // `next-auth.session-token` is the salt. Match what NextAuth uses.
-      salt: 'next-auth.session-token',
+      salt: 'next-auth.session-token',          // verify against running app
     });
     if (!decoded?.sub) {
       return res.status(401).json({ error: 'invalid_token' });
@@ -602,7 +616,7 @@ export function requireAdmin(req: AuthedRequest, res: Response, next: NextFuncti
 }
 ```
 
-> Verify NextAuth's actual salt/cookie convention against the running app — this varies between NextAuth v4 and v5. Adjust `salt` to match.
+> Verify NextAuth's actual salt/cookie convention against the running app — adjust `salt` to match.
 
 ---
 
@@ -612,6 +626,7 @@ export function requireAdmin(req: AuthedRequest, res: Response, next: NextFuncti
 
 ```ts
 import { getJwtForCurrentSession } from './auth-helpers';
+import type { PresentationDTO, CreatePresentationBody } from '@presentation-ai/shared';
 
 const BASE = process.env.NEXT_PUBLIC_API_URL!;
 
@@ -660,32 +675,94 @@ export const sseUrl = (path: string) => `${BASE}${path}`;
 // useChat({ api: sseUrl('/v1/generate/outline'), headers: { Authorization: `Bearer ${jwt}` } })
 ```
 
-`apps/web/src/lib/auth-helpers.ts`:
+For client components, expose the JWT via `apps/web/src/app/api/auth/jwt/route.ts`:
 
 ```ts
-'use server';
 import { getToken } from 'next-auth/jwt';
-import { headers } from 'next/headers';
+import { type NextRequest, NextResponse } from 'next/server';
 
-export async function getJwtForCurrentSession(): Promise<string | null> {
-  const h = await headers();
-  // Reconstruct a minimal req-like object for getToken
-  const cookie = h.get('cookie') ?? '';
-  // ... or call NextAuth's session endpoint internally and extract the raw token
-  // For client components, expose this via a route handler /api/auth/jwt that
-  // reads the cookie server-side and returns { token } so the client can
-  // attach it to Express calls.
-  return null; // sketch — real impl depends on NextAuth version
+export async function GET(req: NextRequest) {
+  const token = await req.cookies.get('next-auth.session-token')?.value;
+  if (!token) return NextResponse.json({ token: null }, { status: 401 });
+  return NextResponse.json({ token });
 }
 ```
 
-For client components, the simplest pattern is a tiny Next.js route `/api/auth/jwt/route.ts` that runs `getToken({ req })` server-side and returns `{ token }`. The client fetches it once on mount (and refreshes on session change).
+(Or use `getToken({ req, raw: true })` to re-encode.) The client fetches this once on mount and caches it in memory.
 
 ---
 
-## 9. Express bootstrap code
+## 9. Express bootstrap + Drizzle handler example
 
-`apps/api/src/index.ts`:
+### `apps/api/src/server/db.ts`
+
+```ts
+import { drizzle } from 'drizzle-orm/node-postgres';
+import { Pool } from 'pg';
+import * as schema from '@presentation-ai/shared/db/schema';
+import * as relations from '@presentation-ai/shared/db/relations';
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+export const db = drizzle(pool, { schema: { ...schema, ...relations } });
+export type DB = typeof db;
+```
+
+### `apps/web/src/server/db.ts` (NextAuth adapter only)
+
+```ts
+import { drizzle } from 'drizzle-orm/node-postgres';
+import { Pool } from 'pg';
+import * as schema from '@presentation-ai/shared/db/schema';
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+export const db = drizzle(pool, { schema });
+```
+
+### `apps/web/src/server/auth.ts`
+
+```ts
+import NextAuth from 'next-auth';
+import Google from 'next-auth/providers/google';
+import { DrizzleAdapter } from '@auth/drizzle-adapter';
+import { db } from './db';
+
+export const { handlers, signIn, signOut, auth } = NextAuth({
+  adapter: DrizzleAdapter(db),
+  providers: [
+    Google({
+      clientId: process.env.GOOGLE_CLIENT_ID!,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+    }),
+  ],
+  session: { strategy: 'jwt' },
+  callbacks: {
+    async jwt({ token, user }) {
+      if (user) {
+        // first sign-in: load auth fields from DB
+        const [row] = await db.query.users.findMany({
+          where: (u, { eq }) => eq(u.id, user.id!),
+          limit: 1,
+        });
+        if (row) {
+          token.role = row.role;
+          token.hasAccess = row.hasAccess;
+          token.isAdmin = row.role === 'ADMIN';
+        }
+      }
+      return token;
+    },
+    async session({ session, token }) {
+      session.user.id = token.sub!;
+      session.user.role = token.role;
+      session.user.hasAccess = token.hasAccess;
+      session.user.isAdmin = token.isAdmin;
+      return session;
+    },
+  },
+});
+```
+
+### `apps/api/src/index.ts`
 
 ```ts
 import 'dotenv/config';
@@ -711,7 +788,7 @@ app.use(logger);
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-app.use('/v1', jwtMiddleware);              // applied after public allowlist inside middleware
+app.use('/v1', jwtMiddleware);
 app.use('/v1/generate', generateRouter);
 app.use('/v1/agent', agentRouter);
 app.use('/v1/diagrams', diagramsRouter);
@@ -727,7 +804,71 @@ const port = Number(process.env.PORT ?? 3001);
 app.listen(port, () => console.log(`api listening on :${port}`));
 ```
 
-A single route handler example — `apps/api/src/routes/generate.ts` (outline):
+### Example route handler — `apps/api/src/routes/presentations.ts`
+
+```ts
+import { Router } from 'express';
+import { eq, and, desc, lt } from 'drizzle-orm';
+import { db } from '../server/db.js';
+import { presentations, baseDocuments } from '@presentation-ai/shared/db/schema';
+import { canEditDocument, canReadDocument } from '../server/share/authorization.js';
+import { UpdatePresentationSchema } from '@presentation-ai/shared';
+import type { AuthedRequest } from '../middleware/jwt.js';
+
+const router = Router();
+
+router.get('/', async (req: AuthedRequest, res, next) => {
+  try {
+    const { cursor, limit = '20' } = req.query as Record<string, string>;
+    const rows = await db.query.baseDocuments.findMany({
+      where: (doc, { eq, and, lt }) =>
+        and(
+          eq(doc.userId, req.user!.id),
+          eq(doc.type, 'PRESENTATION'),
+          cursor ? lt(doc.createdAt, new Date(cursor)) : undefined,
+        ),
+      with: { presentation: true },
+      orderBy: (doc, { desc }) => desc(doc.createdAt),
+      limit: Number(limit),
+    });
+    const nextCursor = rows.length === Number(limit)
+      ? rows[rows.length - 1].createdAt.toISOString()
+      : null;
+    res.json({ items: rows, nextCursor });
+  } catch (e) { next(e); }
+});
+
+router.get('/:id', async (req: AuthedRequest, res, next) => {
+  try {
+    const ok = await canReadDocument(req.user!.id, req.params.id);
+    if (!ok) return res.status(404).json({ error: 'not_found' });
+    const row = await db.query.presentations.findFirst({
+      where: eq(presentations.id, req.params.id),
+      with: { base: true },
+    });
+    if (!row) return res.status(404).json({ error: 'not_found' });
+    res.json(row);
+  } catch (e) { next(e); }
+});
+
+router.patch('/:id', async (req: AuthedRequest, res, next) => {
+  try {
+    const ok = await canEditDocument(req.user!.id, req.params.id);
+    if (!ok) return res.status(403).json({ error: 'forbidden' });
+    const body = UpdatePresentationSchema.parse(req.body);
+    const [row] = await db
+      .update(presentations)
+      .set(body)
+      .where(eq(presentations.id, req.params.id))
+      .returning();
+    res.json(row);
+  } catch (e) { next(e); }
+});
+
+export default router;
+```
+
+### Example streaming handler — `apps/api/src/routes/generate.ts`
 
 ```ts
 import { Router } from 'express';
@@ -736,7 +877,7 @@ import { toUIMessageStream } from '@ai-sdk/langchain';
 import { PromptTemplate } from '@langchain/core/prompts';
 import { RunnableSequence } from '@langchain/core/runnables';
 import { modelPicker } from '../lib/modelPicker.js';
-import { OutlineSchema } from '@presentation/shared';
+import { OutlineSchema } from '@presentation-ai/shared';
 import type { AuthedRequest } from '../middleware/jwt.js';
 
 const router = Router();
@@ -755,28 +896,49 @@ router.post('/outline', async (req: AuthedRequest, res, next) => {
 export default router;
 ```
 
+### Authorization helper port — `apps/api/src/server/share/authorization.ts`
+
+```ts
+import { eq } from 'drizzle-orm';
+import { db } from '../db.js';
+import { baseDocuments } from '@presentation-ai/shared/db/schema';
+
+export async function canEditDocument(userId: string, documentId: string) {
+  const row = await db.query.baseDocuments.findFirst({
+    where: eq(baseDocuments.id, documentId),
+    columns: { userId: true },
+  });
+  return row?.userId === userId;
+}
+
+export async function canReadDocument(userId: string, documentId: string) {
+  const row = await db.query.baseDocuments.findFirst({
+    where: eq(baseDocuments.id, documentId),
+    columns: { userId: true, isPublic: true },
+  });
+  if (!row) return false;
+  return row.userId === userId || row.isPublic;
+}
+```
+
 ---
 
 ## 10. Phased migration plan with exact commands
 
-**Phase A — Workspace skeleton (no behavior change yet)**
+### Phase A — Workspace skeleton (no behavior change yet)
 
 ```bash
 # At repo root
-mkdir -p apps/web apps/api/src packages/shared/src
-# Move current Next.js into apps/web — preserve git history with git mv
+mkdir -p apps/web apps/api/src packages/shared/src/db
 git mv src apps/web/src
-git mv prisma apps/api/prisma
 git mv next.config.js apps/web/
 git mv next-env.d.ts apps/web/
 git mv tailwind.config.ts apps/web/
 git mv postcss.config.mjs apps/web/
 git mv components.json apps/web/
 git mv tsconfig.json apps/web/
-git mv biome.json .                       # biome can stay at root
 git mv package.json apps/web/
-# Create new root package.json with workspaces, pnpm-workspace.yaml
-# Create apps/api/package.json
+# Keep prisma/ at root for now — we'll delete it after Drizzle is wired up
 ```
 
 `pnpm-workspace.yaml`:
@@ -794,25 +956,66 @@ Root `package.json`:
   "scripts": {
     "dev": "pnpm -F web dev & pnpm -F api dev",
     "build": "pnpm -r build",
-    "type": "pnpm -r type"
+    "type": "pnpm -r type",
+    "db:pull": "pnpm -F api drizzle-kit pull",
+    "db:generate": "pnpm -F api drizzle-kit generate",
+    "db:migrate": "pnpm -F api drizzle-kit migrate"
   }
 }
 ```
 
-`apps/api/package.json` deps: `express`, `cors`, `zod`, `next-auth` (for `decode`), `@ai-sdk/express`, `@ai-sdk/langchain`, `@langchain/core`, `@langchain/openai`, `@langchain/langgraph`, `@langchain/langgraph-checkpoint-postgres`, `@prisma/client`, `prisma`, `tsx`, `typescript`, `pg`, `@tavily/core`, `@fal-ai/client`, `together-ai`, `pino`, `pino-http`, plus all model SDKs the existing code uses.
+### Phase B — Move the AI core (still using Prisma)
 
-**Phase B — Move the AI core**
-
-Move these into `apps/api/src/`:
 ```bash
 git mv apps/web/src/ai apps/api/src/ai
 git mv apps/web/src/lib/modelPicker.ts apps/api/src/lib/modelPicker.ts
 git mv apps/web/src/lib/observability apps/api/src/lib/observability
-git mv apps/web/src/server/db.ts apps/api/src/server/db.ts
 git mv apps/web/src/server/share apps/api/src/server/share
 ```
 
-**Phase C — Add JWT verifier in Express, port one route**
+At this point `apps/api` doesn't run yet — bootstrap is in the next phase.
+
+### Phase C — Wire Drizzle (replace Prisma entirely)
+
+1. Install Drizzle in both apps:
+   ```bash
+   # apps/api
+   pnpm -F api add drizzle-orm pg
+   pnpm -F api add -D drizzle-kit @types/pg tsx typescript
+
+   # apps/web
+   pnpm -F web add drizzle-orm pg @auth/drizzle-adapter
+   pnpm -F web add -D @types/pg
+   pnpm -F web remove @auth/prisma-adapter @prisma/client prisma
+   ```
+
+2. Add `apps/api/drizzle.config.ts`:
+   ```ts
+   import type { Config } from 'drizzle-kit';
+
+   export default {
+     schema: '../../packages/shared/src/db/schema.ts',
+     out: './drizzle',
+     dialect: 'postgresql',
+     dbCredentials: { url: process.env.DATABASE_URL! },
+   } satisfies Config;
+   ```
+
+3. Generate the schema by introspecting the existing Prisma-managed DB:
+   ```bash
+   pnpm -F api drizzle-kit pull
+   # This writes apps/api/drizzle/schema.ts. Move it:
+   mv apps/api/drizzle/schema.ts packages/shared/src/db/schema.ts
+   ```
+   Clean up the introspected file: rename JS field names to camelCase, add the relations file (Section 11), align with the hand-written reference schema.
+
+4. Create `apps/api/src/server/db.ts` and `apps/web/src/server/db.ts` (Section 9).
+
+5. Rewrite `apps/web/src/server/auth.ts` to use `DrizzleAdapter` (Section 9).
+
+6. Sanity-check by signing in: NextAuth should still upsert `User` + `Account` rows (now via Drizzle). The DB schema is unchanged — only the code path differs.
+
+### Phase D — Add JWT verifier in Express, port one route end-to-end
 
 1. Write `apps/api/src/middleware/jwt.ts` (Section 7).
 2. Write `apps/api/src/index.ts` (Section 9).
@@ -821,44 +1024,277 @@ git mv apps/web/src/server/share apps/api/src/server/share
 5. Update `PresentationGenerationManager` to point `useChat` at `${NEXT_PUBLIC_API_URL}/v1/generate/outline` with `Authorization` header.
 6. `pnpm -F web dev` and `pnpm -F api dev`. Confirm outline streams end-to-end.
 
-**Phase D — Port remaining streaming endpoints**
+### Phase E — Port remaining streaming endpoints
 
 Outline → presentation → slide → image-slides → diagrams ×3 → agent → search.
 
-For each: copy the route body, replace request/response shape, replace `auth()` with `req.user`, replace `createUIMessageStreamResponse` with `pipeUIMessageStreamToResponse`. Test in browser before moving on.
+For each: copy the route body, replace `request.json()` with `req.body`, replace `auth()` with `req.user`, replace `createUIMessageStreamResponse` with `pipeUIMessageStreamToResponse`. Test in browser before moving on.
 
-**Phase E — Port persistence (server actions → REST)**
+### Phase F — Port persistence (server actions → REST + Prisma → Drizzle)
 
-Presentations → themes → font pairs → images. Add corresponding `api.*` methods in `apps/web/src/lib/api.ts`. Replace each server-action import with `api.*`. Search-and-replace by import path:
+For each server action in `apps/web/src/app/_actions/**`:
+
+1. Copy the function body into a new Express route handler.
+2. Translate the Prisma query to Drizzle:
+   - `prisma.presentation.findUnique({ where: { id } })` → `db.query.presentations.findFirst({ where: eq(presentations.id, id) })`
+   - `prisma.presentation.findMany({ where: ..., orderBy: ..., take: 20 })` → `db.query.presentations.findMany({ where: ..., orderBy: ..., limit: 20 })`
+   - `prisma.presentation.create({ data })` → `db.insert(presentations).values(data).returning()`
+   - `prisma.presentation.update({ where, data })` → `db.update(presentations).set(data).where(...).returning()`
+   - `prisma.presentation.delete({ where })` → `db.delete(presentations).where(...)`
+   - `prisma.$transaction([...])` → `db.transaction(async (tx) => { ... })`
+3. Add the corresponding `api.*` method in `apps/web/src/lib/api.ts`.
+4. In the UI, replace each server-action import with `api.*`. Find them with:
+   ```bash
+   grep -RIn "from '@/app/_actions" apps/web/src
+   ```
+
+### Phase G — Remove Prisma & cleanup
 
 ```bash
-grep -RIn "from '@/app/_actions" apps/web/src
-```
-
-For each match, swap to `api.foo.bar(...)`.
-
-**Phase F — Remove backend deps from `apps/web`**
-
-```bash
+# apps/web no longer touches Prisma
 cd apps/web
-pnpm remove @prisma/client prisma langchain @langchain/core @langchain/openai \
-  @langchain/langgraph @langchain/langgraph-checkpoint-postgres \
-  @langchain/pinecone @ai-sdk/langchain @tavily/core @fal-ai/client \
-  together-ai pg ollama-ai-provider
-rm -rf src/ai src/lib/modelPicker.ts src/lib/observability src/server/db.ts src/server/share src/app/api/agent src/app/api/presentation src/app/_actions
+pnpm remove langchain @langchain/core @langchain/openai @langchain/langgraph \
+  @langchain/langgraph-checkpoint-postgres @langchain/pinecone \
+  @ai-sdk/langchain @tavily/core @fal-ai/client together-ai pg ollama-ai-provider
+rm -rf src/ai src/lib/modelPicker.ts src/lib/observability \
+       src/server/share src/app/api/agent src/app/api/presentation src/app/_actions
+
+# Delete Prisma schema and the postinstall script
+cd ../..
+rm -rf prisma
+# Also remove `"postinstall": "prisma generate"` from any package.json
 ```
 
-**Phase G — Polish**
+### Phase H — Polish
 
-- Add CORS for production origin.
-- Add `nginx`/Cloudflare config to disable buffering on `/v1/generate/*`, `/v1/agent/*`, `/v1/diagrams/*`.
-- Add a pino-http logger to Express; expose `/health` and `/ready`.
-- Add basic per-IP rate limiter (`express-rate-limit`) on `/v1/generate/*`.
+- Tighten CORS for production origin.
+- Configure `nginx`/Cloudflare to disable buffering on `/v1/generate/*`, `/v1/agent/*`, `/v1/diagrams/*`.
+- `pino-http` logger; expose `/health` and `/ready`.
+- `express-rate-limit` on `/v1/generate/*`.
+- Generate types: `drizzle-kit generate` (creates SQL migrations going forward).
 - Document the API in `apps/api/README.md`.
 
 ---
 
-## 11. Environment variables — who needs what
+## 11. Translating the Prisma schema to Drizzle (every model)
+
+The current Prisma schema (`prisma/schema.prisma`) maps to this Drizzle file. Place at `packages/shared/src/db/schema.ts`.
+
+```ts
+import {
+  pgTable, pgEnum, text, timestamp, integer, boolean, jsonb, varchar, uniqueIndex, index, primaryKey,
+} from 'drizzle-orm/pg-core';
+import { sql } from 'drizzle-orm';
+
+export const userRoleEnum = pgEnum('UserRole', ['ADMIN', 'USER']);
+
+export const documentTypeEnum = pgEnum('DocumentType', [
+  'NOTE', 'DOCUMENT', 'DRAWING', 'DESIGN', 'STICKY_NOTES',
+  'MIND_MAP', 'RESEARCH_PAPER', 'FLIPBOOK', 'PRESENTATION',
+]);
+
+// ─── Auth tables (NextAuth uses these) ─────────────────────────────
+export const users = pgTable('User', {
+  id: text('id').primaryKey().default(sql`gen_random_uuid()::text`),
+  name: text('name'),
+  email: text('email').unique(),
+  password: text('password'),
+  emailVerified: timestamp('emailVerified', { mode: 'date' }),
+  image: text('image'),
+  createdAt: timestamp('createdAt', { mode: 'date' }).notNull().defaultNow(),
+  updatedAt: timestamp('updatedAt', { mode: 'date' }).notNull().defaultNow(),
+  headline: varchar('headline', { length: 100 }),
+  bio: text('bio'),
+  interests: text('interests').array().notNull().default(sql`ARRAY[]::text[]`),
+  location: text('location'),
+  website: text('website'),
+  role: userRoleEnum('role').notNull().default('USER'),
+  hasAccess: boolean('hasAccess').notNull().default(false),
+});
+
+export const accounts = pgTable(
+  'Account',
+  {
+    id: text('id').primaryKey().default(sql`gen_random_uuid()::text`),
+    userId: text('userId').notNull().references(() => users.id, { onDelete: 'cascade' }),
+    type: text('type').notNull(),
+    provider: text('provider').notNull(),
+    providerAccountId: text('providerAccountId').notNull(),
+    refresh_token: text('refresh_token'),
+    access_token: text('access_token'),
+    expires_at: integer('expires_at'),
+    token_type: text('token_type'),
+    scope: text('scope'),
+    id_token: text('id_token'),
+    session_state: text('session_state'),
+    refresh_token_expires_in: integer('refresh_token_expires_in'),
+  },
+  (t) => [uniqueIndex('Account_provider_providerAccountId_key').on(t.provider, t.providerAccountId)],
+);
+
+// ─── Documents & presentations ─────────────────────────────────────
+export const baseDocuments = pgTable('BaseDocument', {
+  id: text('id').primaryKey().default(sql`gen_random_uuid()::text`),
+  title: text('title').notNull(),
+  type: documentTypeEnum('type').notNull(),
+  userId: text('userId').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  thumbnailUrl: text('thumbnailUrl'),
+  createdAt: timestamp('createdAt', { mode: 'date' }).notNull().defaultNow(),
+  updatedAt: timestamp('updatedAt', { mode: 'date' }).notNull().defaultNow(),
+  isPublic: boolean('isPublic').notNull().default(false),
+  documentType: text('documentType').notNull(),
+});
+
+export const presentations = pgTable('Presentation', {
+  id: text('id').primaryKey().references(() => baseDocuments.id, { onDelete: 'cascade' }),
+  content: jsonb('content').notNull(),
+  theme: text('theme').notNull().default('mystique'),
+  imageSource: text('imageSource').default('ai'),
+  prompt: text('prompt'),
+  presentationStyle: text('presentationStyle'),
+  customization: jsonb('customization'),
+  language: text('language').default('en-US'),
+  outline: text('outline').array().notNull().default(sql`ARRAY[]::text[]`),
+  searchResults: jsonb('searchResults'),
+  templateId: text('templateId'),
+});
+
+// ─── Themes ────────────────────────────────────────────────────────
+export const presentationThemes = pgTable(
+  'CustomTheme',                   // matches Prisma's @@map
+  {
+    id: text('id').primaryKey().default(sql`gen_random_uuid()::text`),
+    name: text('name').notNull(),
+    description: text('description'),
+    userId: text('userId').notNull().references(() => users.id, { onDelete: 'cascade' }),
+    logoUrl: text('logoUrl'),
+    isPublic: boolean('isPublic').notNull().default(false),
+    createdAt: timestamp('createdAt', { mode: 'date' }).notNull().defaultNow(),
+    updatedAt: timestamp('updatedAt', { mode: 'date' }).notNull().defaultNow(),
+    isAdmin: boolean('isAdmin').notNull().default(false),
+    themeData: jsonb('themeData').notNull(),
+  },
+  (t) => [index('CustomTheme_userId_idx').on(t.userId)],
+);
+
+export const favoritePresentationThemes = pgTable(
+  'FavoritePresentationTheme',
+  {
+    id: text('id').primaryKey().default(sql`gen_random_uuid()::text`),
+    userId: text('userId').notNull().references(() => users.id, { onDelete: 'cascade' }),
+    themeId: text('themeId').notNull().references(() => presentationThemes.id, { onDelete: 'cascade' }),
+    createdAt: timestamp('createdAt', { mode: 'date' }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('FavoritePresentationTheme_userId_themeId_key').on(t.userId, t.themeId),
+    index('FavoritePresentationTheme_userId_idx').on(t.userId),
+    index('FavoritePresentationTheme_themeId_idx').on(t.themeId),
+  ],
+);
+
+export const presentationThemeLikes = pgTable(
+  'PresentationThemeLike',
+  {
+    id: text('id').primaryKey().default(sql`gen_random_uuid()::text`),
+    userId: text('userId').notNull().references(() => users.id, { onDelete: 'cascade' }),
+    themeId: text('themeId').notNull().references(() => presentationThemes.id, { onDelete: 'cascade' }),
+    createdAt: timestamp('createdAt', { mode: 'date' }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('PresentationThemeLike_userId_themeId_key').on(t.userId, t.themeId),
+    index('PresentationThemeLike_userId_idx').on(t.userId),
+    index('PresentationThemeLike_themeId_idx').on(t.themeId),
+  ],
+);
+
+// ─── Fonts ─────────────────────────────────────────────────────────
+export const fontPairs = pgTable(
+  'FontPair',
+  {
+    id: text('id').primaryKey().default(sql`gen_random_uuid()::text`),
+    heading: text('heading').notNull(),
+    headingUrl: text('headingUrl'),
+    headingWeight: integer('headingWeight').notNull().default(700),
+    body: text('body').notNull(),
+    bodyUrl: text('bodyUrl'),
+    bodyWeight: integer('bodyWeight').notNull().default(400),
+    userId: text('userId').notNull().references(() => users.id, { onDelete: 'cascade' }),
+    createdAt: timestamp('createdAt', { mode: 'date' }).notNull().defaultNow(),
+    updatedAt: timestamp('updatedAt', { mode: 'date' }).notNull().defaultNow(),
+  },
+  (t) => [index('FontPair_userId_idx').on(t.userId)],
+);
+
+// ─── Favorites & generated images ──────────────────────────────────
+export const favoriteDocuments = pgTable(
+  'FavoriteDocument',
+  {
+    id: text('id').primaryKey().default(sql`gen_random_uuid()`),
+    documentId: text('documentId').notNull().references(() => baseDocuments.id, { onDelete: 'cascade' }),
+    userId: text('userId').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  },
+  (t) => [uniqueIndex('FavoriteDocument_userId_documentId_key').on(t.userId, t.documentId)],
+);
+
+export const generatedImages = pgTable('GeneratedImage', {
+  id: text('id').primaryKey().default(sql`gen_random_uuid()::text`),
+  url: text('url').notNull(),
+  createdAt: timestamp('createdAt', { mode: 'date' }).notNull().defaultNow(),
+  updatedAt: timestamp('updatedAt', { mode: 'date' }).notNull().defaultNow(),
+  userId: text('userId').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  prompt: text('prompt').notNull(),
+});
+```
+
+`packages/shared/src/db/relations.ts`:
+
+```ts
+import { relations } from 'drizzle-orm';
+import {
+  users, accounts, baseDocuments, presentations,
+  presentationThemes, favoritePresentationThemes, presentationThemeLikes,
+  fontPairs, favoriteDocuments, generatedImages,
+} from './schema';
+
+export const usersRelations = relations(users, ({ many }) => ({
+  accounts: many(accounts),
+  documents: many(baseDocuments),
+  favorites: many(favoriteDocuments),
+  generatedImages: many(generatedImages),
+  presentationThemes: many(presentationThemes),
+  favoritePresentationThemes: many(favoritePresentationThemes),
+  presentationThemeLikes: many(presentationThemeLikes),
+  fontPairs: many(fontPairs),
+}));
+
+export const accountsRelations = relations(accounts, ({ one }) => ({
+  user: one(users, { fields: [accounts.userId], references: [users.id] }),
+}));
+
+export const baseDocumentsRelations = relations(baseDocuments, ({ one, many }) => ({
+  user: one(users, { fields: [baseDocuments.userId], references: [users.id] }),
+  presentation: one(presentations),
+  favorites: many(favoriteDocuments),
+}));
+
+export const presentationsRelations = relations(presentations, ({ one }) => ({
+  base: one(baseDocuments, { fields: [presentations.id], references: [baseDocuments.id] }),
+}));
+
+export const presentationThemesRelations = relations(presentationThemes, ({ one, many }) => ({
+  user: one(users, { fields: [presentationThemes.userId], references: [users.id] }),
+  favorites: many(favoritePresentationThemes),
+  likes: many(presentationThemeLikes),
+}));
+
+// (other relations follow the same pattern)
+```
+
+> **Critical detail:** the table names passed to `pgTable('Foo', ...)` must match the existing PostgreSQL table names *exactly*. Prisma uses PascalCase by default (`User`, `Account`, ...), so Drizzle must use the same. Note `presentationThemes` maps to **`CustomTheme`** because the Prisma model has `@@map("CustomTheme")`. The `userId`, `createdAt`, etc. column names are also case-sensitive Postgres identifiers — keep them as written.
+
+---
+
+## 12. Environment variables — who needs what
 
 **`apps/web/.env`**
 ```
@@ -868,11 +1304,12 @@ GOOGLE_CLIENT_ID=...
 GOOGLE_CLIENT_SECRET=...
 NEXT_PUBLIC_API_URL=https://api.example.com
 UPLOADTHING_TOKEN=...
+DATABASE_URL=postgresql://...           # ⚠ also here, but ONLY for the DrizzleAdapter
 ```
 
 **`apps/api/.env`**
 ```
-NEXTAUTH_SECRET=<shared>             # MUST match apps/web
+NEXTAUTH_SECRET=<shared>                # MUST match apps/web
 DATABASE_URL=postgresql://...
 WEB_ORIGIN=https://app.example.com
 PORT=3001
@@ -884,19 +1321,19 @@ TAVILY_API_KEY=...
 UNSPLASH_ACCESS_KEY=...
 PIXABAY_API_KEY=...
 GIPHY_API_KEY=...
-PINECONE_API_KEY=...                 # if used
-GOOGLE_GENAI_API_KEY=...             # for diagrams (Gemini)
+PINECONE_API_KEY=...
+GOOGLE_GENAI_API_KEY=...                # for diagrams (Gemini)
 ```
 
-The web app no longer needs any model API keys, no `DATABASE_URL`, no Tavily key, etc.
+> The web app needing `DATABASE_URL` is the carve-out from "DB owned by Express" — it's used by the NextAuth adapter only, on the server side, never exposed to the browser. If you want stricter separation, replace `@auth/drizzle-adapter` with a custom adapter that calls Express HTTP endpoints — see Section 14.
 
 ---
 
-## 12. Verification checklist
+## 13. Verification checklist
 
 **Per-endpoint smoke tests (curl):**
 ```bash
-# 1. Mint a JWT — easiest is to sign in at the web app, then GET /api/auth/jwt
+# 1. Mint a JWT — sign in at the web app, then GET /api/auth/jwt
 JWT=$(curl -s -b "$COOKIES" http://localhost:3000/api/auth/jwt | jq -r .token)
 
 # 2. Streaming
@@ -905,16 +1342,22 @@ curl -N -X POST http://localhost:3001/v1/generate/outline \
   -H "Content-Type: application/json" \
   -d '{"prompt":"A talk about pufferfish","numberOfCards":5,"language":"en-US"}'
 
-# 3. CRUD
+# 3. CRUD (Drizzle-backed)
 curl http://localhost:3001/v1/presentations -H "Authorization: Bearer $JWT"
 
 # 4. Public (no header)
 curl http://localhost:3001/v1/presentations/<id>/shared
 ```
 
+**Drizzle/DB sanity:**
+```bash
+pnpm -F api drizzle-kit pull          # should produce no diff once schema is correct
+psql $DATABASE_URL -c '\dt'           # tables unchanged
+```
+
 **End-to-end golden path (browser):**
-1. Sign in via Google → land on dashboard → list loads from Express.
-2. Create presentation → outline streams → confirm → full slide generation streams → slides render → auto-save round-trips.
+1. Sign in via Google → DrizzleAdapter writes User+Account → land on dashboard → list loads from Express.
+2. Create presentation → outline streams → confirm → full slide generation streams → slides render → auto-save round-trips through Express+Drizzle.
 3. Open present mode → start agent chat → tool calls (`replace_image`, `edit_slide_properties`) execute and update slides live.
 4. Open `/share/presentation/<id>` for a public presentation in incognito → loads without auth.
 
@@ -929,11 +1372,12 @@ Mint a JWT signed with `NEXTAUTH_SECRET` from a scratch project and hit `/v1/gen
 
 ---
 
-## 13. Out of scope (future work)
+## 14. Out of scope (future work)
 
+- Replace the apps/web Drizzle adapter with a custom HTTP adapter that calls Express, to remove the `DATABASE_URL` from apps/web entirely.
 - API keys / OAuth client-credentials flow for non-Next consumers.
 - Moving UploadThing into Express.
-- Splitting Prisma schema across two DBs (AI-state vs user data).
 - Per-tenant rate limiting / billing / quotas.
 - OpenAPI spec generation from the zod schemas in `packages/shared`.
 - **Decision needed:** local model discovery (Ollama/LM Studio) currently probes `localhost`. Once moved to Express, that means *the API host's localhost*, not the user's. If browser-local discovery is required, leave `/v1/models/local` as a Next.js route or call Ollama directly from the browser.
+- Going forward: write new schema changes in Drizzle (`drizzle-kit generate`) — no Prisma left to maintain.
